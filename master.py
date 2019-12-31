@@ -1,0 +1,174 @@
+import socket
+import threading
+import logging
+import time
+import hashlib
+import traceback
+import sqlite3
+import os
+
+"""
+Upload
+Download
+Delete
+
+B1  B2  COMMAND
+a   *   Question
+b   *   Request
+
+a   0   ID -- Should respond with x00 if has no ID(ea)
+
+b   0   Upload file
+"""
+
+class MasterNode:
+    def __init__(self):
+        logging.basicConfig(format="%(asctime)s %(message)s", level=logging.INFO, datefmt="%H:%M:%S")
+        
+        self.DB_URI = "file:rfs?mode=memory&cache=shared"
+        self.createDB()
+
+        self.PORT = 5900
+
+        self.server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.server.bind(("localhost", self.PORT))
+
+        logging.info("Server initialized...")
+
+
+    def checkOnlineNodes(self):
+        while True:
+            for node in sqlite3.connect(self.DB_URI).cursor().execute("SELECT ip FROM nodes"):
+                threading.Thread(target=ping, args=(node)).start()
+
+            time.sleep(15)
+
+
+    def ping(self, server_ip):
+        db_conn = sqlite3.connect(self.DB_URI)
+        cursor = db_conn.cursor()
+
+        try:
+            temp_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            temp_sock.settimeout(2)
+            temp_sock.connect((server_ip, self.PORT))
+            temp_sock.send(b"\xa0")
+            id = temp_sock.recv(1)
+
+            if id == b"\x00":
+                used_ids = [int(used_id, 16) for used_id in cursor.execute("SELECT id FROM nodes").fetchall()]
+                
+                for val in range(1, 255):
+                    if val not in used_ids:
+                        id = f"{val:0{2}x}"
+
+                temp_sock.send(bytes.fromhex(id))
+
+                cursor.execute("INSERT INTO nodes VALUES (?, ?, ?)", (id, server_ip, "True"))
+
+                logging.info("New server online: {0} @ {1}".format(id, server_ip))
+        
+        except TimeoutError:
+            id = ""
+
+        finally:
+            temp_sock.close()
+
+        if id == "":
+            cursor.execute("UPDATE nodes SET online = True WHERE ip = ?", (server_ip,))
+        
+        elif id != cursor.execute("SELECT id FROM nodes WHERE ip = ?", (server_ip,)).fetchone():
+            cursor.execute("DELETE FROM nodes WHERE id = ?", (id,))
+            cursor.execute("DELETE FROM nodes WHERE ip = ?", (server_ip,))
+            cursor.execute("INSERT INTO nodes VALUES (?, ?, ?)", (id, server_ip, "True"))
+            
+            logging.error("Server ID/IP mismatch found: {0} @ {1}".format(id, server_ip))
+
+        else:
+            if cursor.execute("SELECT online FROM nodes WHERE id = ?", (id,)).fetchone() == "False":
+                cursor.execute("UPDATE nodes SET online = True WHERE id = ?", (id,)) 
+            
+            logging.info("Server is online: {0}".format(server_ip))
+
+        db_conn.commit()
+
+
+    def onConnect(connection, client):
+        db_conn = sqlite3.connect(self.DB_URI)
+        cursor = db_conn.cursor()
+
+        control_byte = connection.recv(1)
+
+        try:
+            if control_byte == b"\xb0":    #upload file
+                server_count = len(cursor.execute("SELECT node FROM nodes WHERE online = True").fetchall())
+                
+                connection.send(bytes.fromhex(f"{server_count:0{2}x}"))
+                
+                #client counts no of chunks, assigns chunk ids (via hashlib), sends them all back
+                
+                chunk_metadata = connection.recv(4096) #max val @ 255 servers with replication 3
+                chunk_count = len(chunk_count)
+                
+                if (chunk_count % 32) != 0:
+                    raise Exception("Invalid chunk metadata recieved")
+
+                i = 0
+                chunk_ids = []
+                indexes = [x for x in range(0, chunk_count, 32)]
+
+                for i in range(0, len(indexes) - 1):
+                    chunk_ids.append(chunk_metadata[indexes[i] : indexes[i + 1]])
+
+                online_servers = cursor.execute("SELECT ip FROM nodes WHERE online = True").fetchall()
+                
+                if len(online_servers) != server_count:
+                    raise Exception("Server went offline during transaction")
+
+                else:
+                    mappings = list(zip(online_servers, chunk_ids))
+                    
+                    for (ip, chunk) in mappings:
+                        cursor.execute("INSERT INTO ")
+
+            else:
+                logging.error("Invalid control byte from connection {0}".format(client))
+
+        except:
+            logging.error(traceback.format_exc())
+
+        finally:
+            connection.close()
+
+        print(message)
+        logging.info(client)
+
+
+    def createDB(self):
+        db_conn = sqlite3.connect(self.DB_URI)
+        cursor = db_conn.cursor()
+        cursor.execute("CREATE TABLE nodes (node STRING, ip STRING, online BOOL, PRIMARY KEY (node, ip))")
+        cursor.execute("CREATE TABLE chunks (chunk STRING PRIMARY KEY, file STRING)")
+        cursor.execute("CREATE TABLE chunkNodes (chunk STRING, node STRING, PRIMARY KEY (chunk, node))")
+        db_conn.commit()
+
+        logging.info("Database created...")
+
+
+    def listen(self):
+        try:            
+            self.server.listen()
+
+            threading.Thread(target=checkOnlineNodes).start()
+
+            while True:
+                connection, client = server.accept() 
+                threading.Thread(target=onConnect, args=(connection, client)).start()
+
+        except:
+            logging.error(traceback.format_exc())
+
+        finally:
+            logging.info("Server shutting down...")
+            self.server.close()
