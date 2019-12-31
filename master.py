@@ -127,10 +127,11 @@ class MasterNode:
                     raise Exception("Server went offline during transaction")
 
                 else:
-                    mappings = list(zip(online_servers, chunk_ids))
+                    mappings = list(zip(chunk_ids, online_servers))
                     
-                    for (ip, chunk) in mappings:
-                        cursor.execute("INSERT INTO ")
+                    for (chunk, ip) in mappings:
+                        id = cursor.execute("SELECT node FROM nodes WHERE ip = ?", (ip,)).fetchone()
+                        cursor.execute("INSERT INTO chunkNodes VALUES (?, ?)", (chunk, id))
 
             else:
                 logging.error("Invalid control byte from connection {0}".format(client))
@@ -141,7 +142,8 @@ class MasterNode:
         finally:
             connection.close()
 
-        print(message)
+        db_conn.commit()
+        
         logging.info(client)
 
 
