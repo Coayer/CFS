@@ -18,7 +18,8 @@ b   *   Request
 
 a   0   ID -- Should respond with x00 if has no ID(ea)
 
-b   0   Upload file
+b   0   Upload
+b   1   Delete
 """
 
 class MasterNode:
@@ -40,7 +41,7 @@ class MasterNode:
     def checkOnlineNodes(self):
         while True:
             for node in sqlite3.connect(self.DB_URI).cursor().execute("SELECT ip FROM nodes"):
-                threading.Thread(target=ping, args=(node)).start()
+                threading.Thread(target=self.ping, args=(node)).start()
 
             time.sleep(15)
 
@@ -119,7 +120,7 @@ class MasterNode:
                 indexes = [x for x in range(0, chunk_count, 32)]
 
                 for i in range(0, len(indexes) - 1):
-                    chunk_ids.append(chunk_metadata[indexes[i] : indexes[i + 1]])
+                    chunk_ids.append(chunk_metadata[indexes[i]:indexes[i + 1]])
 
                 online_servers = cursor.execute("SELECT ip FROM nodes WHERE online = True").fetchall()
                 
@@ -127,14 +128,25 @@ class MasterNode:
                     raise Exception("Server went offline during transaction")
 
                 else:
-                    mappings = list(zip(chunk_ids, online_servers))
+                    connection.send((str(online_servers)[1:-1:]).encode()) #client should error check that all chunks recvd
                     
-                    for (chunk, ip) in mappings:
+                    filename = connection.recv(1024).decode()
+
+                    for (chunk, ip) in list(zip(chunk_ids, online_servers)):
                         id = cursor.execute("SELECT node FROM nodes WHERE ip = ?", (ip,)).fetchone()
                         cursor.execute("INSERT INTO chunkNodes VALUES (?, ?)", (chunk, id))
+                        cursor.execute("INSERT INTO chunks VALUES (?, ?)", (chunk, filename))
+
+            elif control_byte == b"\xb1":    #delete file
+                filename = connection.recv(1024).decode()
+
+                servers_with_file = cursor.execute("SELECT ip FROM nodes WHERE chunks.file = ? AND chunks.chunk = chunkNodes.chunk AND chunkNodes.node = nodes.node").fetchall()
+
+                for server in servers_with_file:
+                    threading.Thread(target=self.deleteFile, args=(server, filename)).start()
 
             else:
-                logging.error("Invalid control byte from connection {0}".format(client))
+                raise Exception("Invalid control byte from connection {0}".format(client))
 
         except:
             logging.error(traceback.format_exc())
@@ -146,6 +158,28 @@ class MasterNode:
         
         logging.info(client)
 
+
+    def deleteFile(self, server_ip, filename):
+        db_conn = sqlite3.connect(self.DB_URI)
+        cursor = db_conn.cursor()
+
+        temp_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        temp_sock.settimeout(2)
+
+        try:
+            temp_sock.connect((server_ip, self.PORT))
+            temp_sock.send(b"\xb1")
+            temp_sock.send(filename.encode())
+            
+            chunk = cursor.execute("SELECT chunk FROM chunkNodes WHERE chunks.file = ? AND chunks.chunk = chunkNodes.chunk AND chunkNodes.node = ?", (filename, server_ip)).fetchone()
+            cursor.execute("DELETE FROM chunks WHERE chunk = ?", (chunk,))
+            db_conn.commit()
+        
+        except:
+            logging.error(traceback.format_exc())
+
+        finally:
+            temp_sock.close()
 
     def createDB(self):
         db_conn = sqlite3.connect(self.DB_URI)
@@ -162,7 +196,7 @@ class MasterNode:
         try:            
             self.server.listen()
 
-            threading.Thread(target=checkOnlineNodes).start()
+            threading.Thread(target=checkOnlineNodes).start() #also add routine check for files not deleted by offline nodes
 
             while True:
                 connection, client = server.accept() 
