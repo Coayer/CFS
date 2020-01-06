@@ -2,36 +2,29 @@ import socket
 import threading
 import logging
 import time
-import hashlib
 import traceback
 import sqlite3
 import os
 import sys
 
 """
-Upload
-Download
-Delete
-
 B1  B2  COMMAND
-a   *   Question
-b   *   Request
-
-a   0   ID -- Should respond with x00 if has no ID(ea)
-
+a   0   ID
 b   0   Upload
 b   1   Delete
 b   2   Retrieve
 """
 
+
 class MasterNode:
     def __init__(self):
         logging.basicConfig(format="%(asctime)s %(message)s", level=logging.INFO, datefmt="%H:%M:%S")
         
-        self.DB_URI = "file:mem?mode=memory&cache=shared"
+        self.DB_URI = "file:memdb?mode=memory&cache=shared"
         self.createDB()
 
         self.TIMEOUT = 0.5
+        self.REFRESH = 5
         self.PORT = 5900
         self.MAX_PATH_LEN = 1024
 
@@ -52,7 +45,7 @@ class MasterNode:
             for node in cursor.execute("SELECT ip FROM nodes").fetchall():
                 threading.Thread(target=self.ping, args=(node)).start()
 
-            time.sleep(0.1)    #polling rate for node checking
+            time.sleep(self.REFRESH)
 
 
     def ping(self, server_ip):
@@ -88,7 +81,7 @@ class MasterNode:
         if id == "":
             cursor.execute("UPDATE nodes SET online = True WHERE ip = ?", (server_ip,))
         
-        elif id != cursor.execute("SELECT id FROM nodes WHERE ip = ?", (server_ip,)).fetchone():
+        elif id != cursor.execute("SELECT id FROM nodes WHERE ip = ?", (server_ip,)).fetchone()[0]:
             cursor.execute("DELETE FROM nodes WHERE id = ?", (id,))
             cursor.execute("DELETE FROM nodes WHERE ip = ?", (server_ip,))
             cursor.execute("INSERT INTO nodes VALUES (?, ?, ?)", (id, server_ip, "True"))
@@ -96,13 +89,35 @@ class MasterNode:
             logging.error("Server ID/IP mismatch found: {0} @ {1}".format(id, server_ip))
 
         else:
-            if cursor.execute("SELECT online FROM nodes WHERE id = ?", (id,)).fetchone() == "False":
+            if cursor.execute("SELECT online FROM nodes WHERE id = ?", (id,)).fetchone()[0] == "False":
                 cursor.execute("UPDATE nodes SET online = True WHERE id = ?", (id,)) 
             
             logging.info("Server is online: {0}".format(server_ip))
 
         db_conn.commit()
         db_conn.close()
+
+
+    def garbageCollection(self):
+        db_conn = sqlite3.connect(self.DB_URI, uri=True)
+        cursor = db_conn.cursor()
+
+        while True:
+            if self.kill_threads:
+                db_conn.close()
+                return
+            
+            deleted_files = cursor.execute("SELECT file FROM files WHERE deleted = True").fetchall()
+
+            for file_path in deleted_files:
+                if len(cursor.execute("SELECT chunk FROM chunks WHERE file = ?", (file_path,)).fetchall()) == 0:
+                    cursor.execute("DELETE FROM files WHERE file = ?", (file_path,))
+                
+                else:
+                    for server in self.serversWithFile(file_path):
+                        threading.Thread(target=self.deleteFile, args=(server, file_path)).start()
+
+            time.sleep(self.REFRESH)
 
 
     def onConnect(self, connection, client):
@@ -144,15 +159,17 @@ class MasterNode:
                     file_path = connection.recv(self.MAX_PATH_LEN).decode()
 
                     for (chunk, ip) in list(zip(chunk_ids, online_servers)):
-                        id = cursor.execute("SELECT node FROM nodes WHERE ip = ?", (ip,)).fetchone()
+                        id = cursor.execute("SELECT node FROM nodes WHERE ip = ?", (ip,)).fetchone()[0]
                         cursor.execute("INSERT INTO chunkNodes VALUES (?, ?)", (chunk, id))
                         cursor.execute("INSERT INTO chunks VALUES (?, ?)", (chunk, file_path))
+                        cursor.execute("INSERT INTO files VALUES (?, False)", (file_path,))
 
             elif control_byte == b"\xb1":    #delete file
                 file_path = connection.recv(self.MAX_PATH_LEN).decode()
                 servers_with_file = self.serversWithFile(file_path)
 
                 logging.info("Deleting file: {0}\nServers storing file: {1}".format(file_path, servers_with_file))
+                cursor.execute("UPDATE files SET deleted = True WHERE file = ?", (file_path,))
 
                 for server in servers_with_file:
                     threading.Thread(target=self.deleteFile, args=(server, file_path)).start()
@@ -201,7 +218,8 @@ class MasterNode:
             temp_sock.send(b"\xb1")
             temp_sock.send(file_path.encode())
             
-            chunk = cursor.execute("SELECT chunk FROM chunkNodes WHERE chunks.file = ? AND chunks.chunk = chunkNodes.chunk AND chunkNodes.node = ?", (file_path, server_ip)).fetchone()
+            chunk = cursor.execute("""SELECT chunk FROM chunkNodes WHERE chunks.file = ? 
+            AND chunks.chunk = chunkNodes.chunk AND chunkNodes.node = ?""", (file_path, server_ip)).fetchone()[0]
             cursor.execute("DELETE FROM chunks WHERE chunk = ?", (chunk,))
             db_conn.commit()
 
@@ -220,16 +238,11 @@ class MasterNode:
         
         cursor.execute("CREATE TABLE nodes (node STRING, ip STRING, online BOOL, PRIMARY KEY (node, ip))")
         cursor.execute("CREATE TABLE chunks (chunk STRING PRIMARY KEY, file STRING)")
+        cursor.execute("CREATE TABLE files (file STRING PRIMARY KEY, deleted BOOL)")
         cursor.execute("CREATE TABLE chunkNodes (chunk STRING, node STRING, PRIMARY KEY (chunk, node))")
         
         db_conn.commit()
         db_conn.close()
-
-
-        db_ = sqlite3.connect(self.DB_URI, uri=True)
-        cu = db_.cursor()
-        cu.execute("SELECT ip FROM nodes").fetchall()
-        db_.close()
 
         logging.info("Database created...")
 
@@ -241,7 +254,8 @@ class MasterNode:
             server.bind(("localhost", self.PORT))
             server.listen()
 
-            threading.Thread(target=self.checkOnlineNodes).start() #also add routine check for files not deleted by offline nodes
+            threading.Thread(target=self.checkOnlineNodes).start()
+            threading.Thread(target=self.garbageCollection).start()
 
             while True:
                 connection, client = server.accept() 
@@ -250,10 +264,14 @@ class MasterNode:
         except:
             logging.error(traceback.format_exc())
             logging.info("Server shutting down...")
+
             self.kill_threads = True
             server.close()
             sys.exit()
 
 
+
+db = sqlite3.connect("file:memdb?mode=memory&cache=shared", uri=True)
 master = MasterNode()
 master.listen()
+db.close()
