@@ -1,9 +1,9 @@
+import pickle
 import socket
 import threading
 import logging
 import time
 import traceback
-import sqlite3
 import os
 import sys
 
@@ -12,9 +12,6 @@ class MasterNode:
     def __init__(self):
         logging.basicConfig(format="%(asctime)s %(message)s", level=logging.INFO, datefmt="%H:%M:%S")
         
-        self.DB_URI = "file:memdb?mode=memory&cache=shared"
-        self.createDB()
-
         self.TIMEOUT = 0.5
         self.REFRESH = 5
         self.PORT = 5900
@@ -26,65 +23,39 @@ class MasterNode:
 
 
     def onConnect(self, connection, client):
-        db_conn = sqlite3.connect(self.DB_URI, uri=True)
-        cursor = db_conn.cursor()
-
         control_byte = connection.recv(1)
-        logging.info("{0} sent {1}".format(client, control_byte))
+        logging.info("{0} sent {1}".format(client, control_byte.decode()))
 
         try:
-            if control_byte == b"\xb0":    #upload file
-                server_count = len(cursor.execute("SELECT node FROM nodes WHERE online = True").fetchall())
-                
-                connection.send(bytes.fromhex(f"{server_count:0{2}x}"))
-                
-                #client counts no of chunks, assigns chunk ids (via hashlib), sends them all back
-                
-                chunk_metadata = connection.recv(4096) #max val @ 255 servers with replication 3
-                chunk_count = len(chunk_metadata)
-                
-                if (chunk_count % 32) != 0:
-                    raise Exception("Invalid chunk metadata recieved")
+            if control_byte == b"\xb0":    #store chunk
+                chunk_id = connection.recv(32)
 
-                i = 0
-                chunk_ids = []
-                indexes = [x for x in range(0, chunk_count, 32)]
+                chunk_data = []
 
-                for i in range(0, len(indexes) - 1):
-                    chunk_ids.append(chunk_metadata[indexes[i]:indexes[i + 1]])
+                while True:
+                    packet_data = connection.recv(1024)    #size of packets sent by client
 
-                online_servers = cursor.execute("SELECT ip FROM nodes WHERE online = True").fetchall()
-                
-                if len(online_servers) != server_count:
-                    raise Exception("Server went offline during transaction")
+                    if packet_data != b"":
+                        chunk_data.append(packet_data)
+                    else:
+                        break
 
-                else:
-                    connection.send((str(online_servers)[1:-1:]).encode()) #client should error check that all chunks recvd
-                    
-                    file_path = connection.recv(self.MAX_PATH_LEN).decode()
+                chunk_data = b"".join(chunk_data)
 
-                    for (chunk, ip) in list(zip(chunk_ids, online_servers)):
-                        id = cursor.execute("SELECT node FROM nodes WHERE ip = ?", (ip,)).fetchone()[0]
-                        cursor.execute("INSERT INTO chunkNodes VALUES (?, ?)", (chunk, id))
-                        cursor.execute("INSERT INTO chunks VALUES (?, ?)", (chunk, file_path))
-                        cursor.execute("INSERT INTO files VALUES (?, False)", (file_path,))
+                with open(chunk_id, "wb") as byte_file:
+                    pickle.dump(chunk_data, byte_file)
 
-            elif control_byte == b"\xb1":    #delete file
-                file_path = connection.recv(self.MAX_PATH_LEN).decode()
-                servers_with_file = self.serversWithFile(file_path)
+            elif control_byte == b"\xb1":    #delete chunk
+                chunk_id = connection.recv(32)
+                os.remove(chunk_id.decode())
 
-                logging.info("Deleting file: {0}\nServers storing file: {1}".format(file_path, servers_with_file))
-                cursor.execute("UPDATE files SET deleted = True WHERE file = ?", (file_path,))
+            elif control_byte == b"\xb2":    #retrieve chunk
+                chunk_id = connection.recv(32)
 
-                for server in servers_with_file:
-                    threading.Thread(target=self.deleteFile, args=(server, file_path)).start()
+                with open(chunk_id, "rb") as byte_file:
+                    chunk_data = pickle.load(byte_file)
 
-            elif control_byte == b"\xb2":    #retrieve file
-                file_path = connection.recv(self.MAX_PATH_LEN).decode()
-                servers_with_file = self.serversWithFile(file_path)
-
-                logging.info("Retrieving file: {0}\nServers storing file: {1}".format(file_path, servers_with_file))
-                connection.send((str(servers_with_file)[1:-1:]).encode())
+                connection.send(chunk_data)
 
             else:
                 raise Exception("Invalid control byte from connection {0}".format(client))
@@ -95,30 +66,12 @@ class MasterNode:
         finally:
             connection.close()
 
-        db_conn.commit()
-        db_conn.close()
-
-
-    def createDB(self):
-        db_conn = sqlite3.connect(self.DB_URI, uri=True)
-        cursor = db_conn.cursor()
-        
-        cursor.execute("CREATE TABLE nodes (node STRING, ip STRING, online BOOL, PRIMARY KEY (node, ip))")
-        cursor.execute("CREATE TABLE chunks (chunk STRING PRIMARY KEY, file STRING)")
-        cursor.execute("CREATE TABLE files (file STRING PRIMARY KEY, deleted BOOL)")
-        cursor.execute("CREATE TABLE chunkNodes (chunk STRING, node STRING, PRIMARY KEY (chunk, node))")
-        
-        db_conn.commit()
-        db_conn.close()
-
-        logging.info("Database created...")
-
 
     def listen(self):
         try:
             server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            server.bind(("localhost", self.PORT))
+            server.bind(("0.0.0.0", self.PORT))
             server.listen()
 
             while True:
@@ -135,7 +88,5 @@ class MasterNode:
 
 
 
-db = sqlite3.connect("file:memdb?mode=memory&cache=shared", uri=True)
 master = MasterNode()
 master.listen()
-db.close()

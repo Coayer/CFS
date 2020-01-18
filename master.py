@@ -117,7 +117,7 @@ class MasterNode:
         cursor = db_conn.cursor()
 
         control_byte = connection.recv(1)
-        logging.info("{0} sent {1}".format(client, control_byte))
+        logging.info("{0} sent {1}".format(client, control_byte.decode()))
 
         try:
             if control_byte == b"\xb0":    #upload file
@@ -150,11 +150,14 @@ class MasterNode:
                     
                     file_path = connection.recv(self.MAX_PATH_LEN).decode()
 
+                    cursor.execute("INSERT INTO files VALUES (?, False)", (file_path,))
+
                     for (chunk, ip) in list(zip(chunk_ids, online_servers)):
-                        id = cursor.execute("SELECT node FROM nodes WHERE ip = ?", (ip,)).fetchone()[0]
-                        cursor.execute("INSERT INTO chunkNodes VALUES (?, ?)", (chunk, id))
-                        cursor.execute("INSERT INTO chunks VALUES (?, ?)", (chunk, file_path))
-                        cursor.execute("INSERT INTO files VALUES (?, False)", (file_path,))
+                        node_id = cursor.execute("SELECT node FROM nodes WHERE ip = ?", (ip,)).fetchone()[0]
+                        cursor.execute("INSERT INTO chunkNodes VALUES (?, ?)", (chunk, node_id))
+
+                        if len(cursor.execute("SELECT file FROM chunks WHERE chunk = ?", (chunk,)).fetchone[0]) == 0:
+                            cursor.execute("INSERT INTO chunks VALUES (?, ?)", (chunk, file_path))
 
             elif control_byte == b"\xb1":    #delete file
                 file_path = connection.recv(self.MAX_PATH_LEN).decode()
@@ -171,7 +174,9 @@ class MasterNode:
                 servers_with_file = self.serversWithFile(file_path)
 
                 logging.info("Retrieving file: {0}\nServers storing file: {1}".format(file_path, servers_with_file))
-                connection.send((str(servers_with_file)[1:-1:]).encode())
+                connection.send((str(servers_with_file)[1:-1:]).encode()) 
+                
+                #ADD CHUNKS IN HERE TOO SO CLIENT KNOWS WHAT TO ASK FOR
 
             else:
                 raise Exception("Invalid control byte from connection {0}".format(client))
@@ -206,12 +211,13 @@ class MasterNode:
         temp_sock.settimeout(self.TIMEOUT)
 
         try:
+            chunk_id = cursor.execute("""SELECT chunk FROM chunkNodes WHERE chunks.file = ? 
+            AND chunks.chunk = chunkNodes.chunk AND chunkNodes.node = ?""", (file_path, server_ip)).fetchone()[0]
+
             temp_sock.connect((server_ip, self.PORT))
             temp_sock.send(b"\xb1")
-            temp_sock.send(file_path.encode())
-            
-            chunk = cursor.execute("""SELECT chunk FROM chunkNodes WHERE chunks.file = ? 
-            AND chunks.chunk = chunkNodes.chunk AND chunkNodes.node = ?""", (file_path, server_ip)).fetchone()[0]
+            temp_sock.send(chunk_id.encode())
+
             cursor.execute("DELETE FROM chunks WHERE chunk = ?", (chunk,))
             db_conn.commit()
 
@@ -243,7 +249,7 @@ class MasterNode:
         try:
             server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            server.bind(("localhost", self.PORT))
+            server.bind(("0.0.0.0", self.PORT))
             server.listen()
 
             threading.Thread(target=self.checkOnlineNodes).start()
