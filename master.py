@@ -26,16 +26,23 @@ class MasterNode:
 
 
     def checkOnlineNodes(self):
-        db_conn = sqlite3.connect(self.DB_URI, uri=True)
-        cursor = db_conn.cursor()
+        temp_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        temp_sock.connect(("1.1.1.1", 53))
+        
+        self.IP_ADDRESS = temp_sock.getsockname()[0]
+        self.SUBNET = (".").join(self.IP_ADDRESS.split(".")[:3]) + "."
+
+        temp_sock.close()
 
         while True:
             if self.kill_threads:
-                db_conn.close()
                 return
 
-            for node in cursor.execute("SELECT ip FROM nodes").fetchall():
-                threading.Thread(target=self.ping, args=(node)).start()
+            for x in range(1, 255):
+                ip = self.SUBNET + str(x)
+                
+                if ip != self.IP_ADDRESS:
+                    threading.Thread(target=self.ping, args=(ip)).start()
 
             time.sleep(self.REFRESH)
 
@@ -71,7 +78,7 @@ class MasterNode:
             temp_sock.close()
 
         if id == "":
-            cursor.execute("UPDATE nodes SET online = True WHERE ip = ?", (server_ip,))
+            cursor.execute("UPDATE nodes SET online = False WHERE ip = ?", (server_ip,))
         
         elif id != cursor.execute("SELECT id FROM nodes WHERE ip = ?", (server_ip,)).fetchone()[0]:
             cursor.execute("DELETE FROM nodes WHERE id = ?", (id,))
@@ -127,32 +134,26 @@ class MasterNode:
                 
                 #client counts no of chunks, assigns chunk ids (via hashlib), sends them all back
                 
-                chunk_metadata = connection.recv(4096) #max val @ 255 servers with replication 3
+                chunk_metadata = connection.recv(4096).decode() #max val @ 255 servers with replication 3
                 chunk_count = len(chunk_metadata)
                 
                 if (chunk_count % 32) != 0:
                     raise Exception("Invalid chunk metadata recieved")
 
-                i = 0
-                chunk_ids = []
-                indexes = [x for x in range(0, chunk_count, 32)]
-
-                for i in range(0, len(indexes) - 1):
-                    chunk_ids.append(chunk_metadata[indexes[i]:indexes[i + 1]])
-
-                online_servers = cursor.execute("SELECT ip FROM nodes WHERE online = True").fetchall()
+                chunk_ids = self.parseChunkIDs(chunk_metadata)
+                server_ips = cursor.execute("SELECT ip FROM nodes WHERE online = True").fetchall()
                 
-                if len(online_servers) != server_count:
+                if len(server_ips) != server_count:
                     raise Exception("Server went offline during transaction")
 
                 else:
-                    connection.send((str(online_servers)[1:-1:]).encode()) #client should error check that all chunks recvd
+                    connection.send((",").join(server_ips).encode())    #client should error check that all chunks recvd
                     
                     file_path = connection.recv(self.MAX_PATH_LEN).decode()
 
-                    cursor.execute("INSERT INTO files VALUES (?, False)", (file_path,))
+                    cursor.execute("INSERT INTO files VALUES (?, ?, False)", (file_path, list(dict.fromkeys(chunk_ids))))    #dict thing dedupes
 
-                    for (chunk, ip) in list(zip(chunk_ids, online_servers)):
+                    for (chunk, ip) in list(zip(chunk_ids, server_ips)):
                         node_id = cursor.execute("SELECT node FROM nodes WHERE ip = ?", (ip,)).fetchone()[0]
                         cursor.execute("INSERT INTO chunkNodes VALUES (?, ?)", (chunk, node_id))
 
@@ -171,13 +172,24 @@ class MasterNode:
 
             elif control_byte == b"\xb2":    #retrieve file
                 file_path = connection.recv(self.MAX_PATH_LEN).decode()
-                servers_with_file = self.serversWithFile(file_path)
+                chunk_ids = self.parseChunkIDs(cursor.execute("SELECT chunkOrder FROM files WHERE file = ?", (file_path,)).fetchone()[0])
+                
+                server_ips = []
+
+                for chunk in chunk_ids:
+                    server_ip = cursor.execute("SELECT ip FROM nodes WHERE chunkNodes.chunk = ? AND chunkNodes.node = nodes.node AND nodes.online = True").fetchone()[0]
+
+                    if server_ip == "":
+                        connection.send(b"\x00")
+                        raise Exception("Server not available, cancelling retrieve transaction")
+
+                    server_ips.append(server_ip)
 
                 logging.info("Retrieving file: {0}\nServers storing file: {1}".format(file_path, servers_with_file))
-                connection.send((str(servers_with_file)[1:-1:]).encode()) 
                 
-                #ADD CHUNKS IN HERE TOO SO CLIENT KNOWS WHAT TO ASK FOR
-
+                connection.send(chunk_ids.encode())
+                connection.send((",").join(server_ips).encode()) 
+                
             else:
                 raise Exception("Invalid control byte from connection {0}".format(client))
 
@@ -189,6 +201,17 @@ class MasterNode:
 
         db_conn.commit()
         db_conn.close()
+
+
+    def parseChunkIDs(self, chunk_metadata):
+        i = 0
+        chunk_ids = []
+        indexes = [x for x in range(0, chunk_count, 32)]
+
+        for i in range(0, len(indexes) - 1):
+            chunk_ids.append(chunk_metadata[indexes[i]:indexes[i + 1]])
+
+        return chunk_ids
 
 
     def serversWithFile(self, file_path):
@@ -236,7 +259,7 @@ class MasterNode:
         
         cursor.execute("CREATE TABLE nodes (node STRING, ip STRING, online BOOL, PRIMARY KEY (node, ip))")
         cursor.execute("CREATE TABLE chunks (chunk STRING PRIMARY KEY, file STRING)")
-        cursor.execute("CREATE TABLE files (file STRING PRIMARY KEY, deleted BOOL)")
+        cursor.execute("CREATE TABLE files (file STRING PRIMARY KEY, chunkOrder STRING, deleted BOOL)")    #chunkOrder stores chunk IDs so file can be reconstructed
         cursor.execute("CREATE TABLE chunkNodes (chunk STRING, node STRING, PRIMARY KEY (chunk, node))")
         
         db_conn.commit()
