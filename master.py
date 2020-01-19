@@ -25,12 +25,14 @@ class MasterNode:
         logging.info("Server initialized...")
 
 
-    def checkOnlineNodes(self):
+    def checkOnlineServers(self):
         temp_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         temp_sock.connect(("1.1.1.1", 53))
         
         self.IP_ADDRESS = temp_sock.getsockname()[0]
         self.SUBNET = (".").join(self.IP_ADDRESS.split(".")[:3]) + "."
+
+        logging.info("Listening at: {0}".format(self.IP_ADDRESS))
 
         temp_sock.close()
 
@@ -38,11 +40,11 @@ class MasterNode:
             if self.kill_threads:
                 return
 
-            for x in range(1, 255):
+            for x in range(1, 254):
                 ip = self.SUBNET + str(x)
-                
+
                 if ip != self.IP_ADDRESS:
-                    threading.Thread(target=self.ping, args=(ip)).start()
+                    threading.Thread(target=self.ping, args=(ip,)).start()
 
             time.sleep(self.REFRESH)
 
@@ -135,12 +137,11 @@ class MasterNode:
                 #client counts no of chunks, assigns chunk ids (via hashlib), sends them all back
                 
                 chunk_metadata = connection.recv(4096).decode() #max val @ 255 servers with replication 3
-                chunk_count = len(chunk_metadata)
-                
-                if (chunk_count % 32) != 0:
+                chunk_ids = self.parseChunkIDs(chunk_metadata)
+
+                if chunk_ids == "":
                     raise Exception("Invalid chunk metadata recieved")
 
-                chunk_ids = self.parseChunkIDs(chunk_metadata)
                 server_ips = cursor.execute("SELECT ip FROM nodes WHERE online = True").fetchall()
                 
                 if len(server_ips) != server_count:
@@ -154,8 +155,8 @@ class MasterNode:
                     cursor.execute("INSERT INTO files VALUES (?, ?, False)", (file_path, list(dict.fromkeys(chunk_ids))))    #dict thing dedupes
 
                     for (chunk, ip) in list(zip(chunk_ids, server_ips)):
-                        node_id = cursor.execute("SELECT node FROM nodes WHERE ip = ?", (ip,)).fetchone()[0]
-                        cursor.execute("INSERT INTO chunkNodes VALUES (?, ?)", (chunk, node_id))
+                        server_id = cursor.execute("SELECT node FROM nodes WHERE ip = ?", (ip,)).fetchone()[0]
+                        cursor.execute("INSERT INTO chunkNodes VALUES (?, ?)", (chunk, server_id))
 
                         if len(cursor.execute("SELECT file FROM chunks WHERE chunk = ?", (chunk,)).fetchone[0]) == 0:
                             cursor.execute("INSERT INTO chunks VALUES (?, ?)", (chunk, file_path))
@@ -204,6 +205,11 @@ class MasterNode:
 
 
     def parseChunkIDs(self, chunk_metadata):
+        chunk_count = len(chunk_metadata)
+
+        if (chunk_count % 32) != 0:
+            return ""
+
         i = 0
         chunk_ids = []
         indexes = [x for x in range(0, chunk_count, 32)]
@@ -275,7 +281,7 @@ class MasterNode:
             server.bind(("0.0.0.0", self.PORT))
             server.listen()
 
-            threading.Thread(target=self.checkOnlineNodes).start()
+            threading.Thread(target=self.checkOnlineServers).start()
             threading.Thread(target=self.garbageCollection).start()
 
             while True:
