@@ -135,8 +135,17 @@ class MasterNode:
                 connection.send(bytes.fromhex(f"{server_count:0{2}x}"))
                 
                 #client counts no of chunks, assigns chunk ids (via hashlib), sends them all back
-                
-                chunk_metadata = connection.recv(4096).decode() #max val @ 255 servers with replication 3
+
+                chunk_metadata = []
+
+                while True:
+                    packet_data = connection.recv(1024)    #size of packets sent by client
+
+                    if packet_data != b"":
+                        chunk_metadata.append(packet_data.decode())
+                    else:
+                        break
+
                 chunk_ids = self.parseChunkIDs(chunk_metadata)
 
                 if chunk_ids == "":
@@ -190,7 +199,10 @@ class MasterNode:
                 
                 connection.send(chunk_ids.encode())
                 connection.send((",").join(server_ips).encode()) 
-                
+            
+            elif control_byte == b"\xa0":
+
+
             else:
                 raise Exception("Invalid control byte from connection {0}".format(client))
 
@@ -207,12 +219,12 @@ class MasterNode:
     def parseChunkIDs(self, chunk_metadata):
         chunk_count = len(chunk_metadata)
 
-        if (chunk_count % 32) != 0:
+        if (chunk_count % 20) != 0:
             return ""
 
         i = 0
         chunk_ids = []
-        indexes = [x for x in range(0, chunk_count, 32)]
+        indexes = [x for x in range(0, chunk_count, 20)]
 
         for i in range(0, len(indexes) - 1):
             chunk_ids.append(chunk_metadata[indexes[i]:indexes[i + 1]])

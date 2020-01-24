@@ -28,7 +28,7 @@ class MasterNode:
 
         try:
             if control_byte == b"\xb0":    #store chunk
-                chunk_id = connection.recv(32)
+                chunk_id = connection.recv(20)
 
                 chunk_data = []
 
@@ -46,11 +46,11 @@ class MasterNode:
                     pickle.dump(chunk_data, byte_file)
 
             elif control_byte == b"\xb1":    #delete chunk
-                chunk_id = connection.recv(32)
+                chunk_id = connection.recv(20)
                 os.remove(chunk_id.decode())
 
             elif control_byte == b"\xb2":    #retrieve chunk
-                chunk_id = connection.recv(32)
+                chunk_id = connection.recv(20)
 
                 with open(chunk_id, "rb") as byte_file:
                     chunk_data = pickle.load(byte_file)
