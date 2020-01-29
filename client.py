@@ -10,28 +10,38 @@ class client:
     def __init__(self):
         self.TIMEOUT = 0.5
         self.PORT = 5900
-        self.MAX_PATH_LEN = 1024
         self.PACKET_SIZE = 1024
 
 
     def main(self):
-        self.MASTER = input("Enter master server IP address:\n")
-        
-        while True:
-            transaction = input("Select file operation (upload, delete, retrieve) followed by file path:\n").split(" ")
-            
-            master_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            master_socket.settimeout(self.TIMEOUT)
-            master_socket.connect((self.MASTER, self.PORT))
-            
-            if transaction[0] == "upload":
-                self.upload(master_socket, transaction[1])
+        command = sys.argv[0]
+        path = sys.argv[1]
+        master = sys.argv[2]
 
-    
+        master_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        master_socket.settimeout(self.TIMEOUT)
+        master_socket.connect((master, self.PORT))
+            
+        if command == "upload":
+            self.upload(master_socket, path)
+
+        elif command == "delete":
+            master_socket.send(b"\xb1")
+            master_socket.send(path.encode())
+
+        elif command == "download":
+            self.download(master_socket, path)
+
+
+    def download(self, master_socket, path):
+        master_socket.send(b"\xb2")
+        master_socket.send(path.encode())
+        
+
     def upload(self, master_socket, path):
         master_socket.send(b"\xb0")
-        server_count = master_socket.recv(1)
 
+        server_count = int(bytes.hex(master_socket.recv(1)), 16)
         chunks = self.splitFile(path, server_count)
         chunk_metadata = []
 
@@ -42,7 +52,26 @@ class client:
         chunk_metadata = b"".join(chunk_metadata)
 
         for i in range(0, len(chunk_metadata), self.PACKET_SIZE):
-            master_socket.send(chunk_metadata[i:i+self.PACKET_SIZE])
+            master_socket.send(chunk_metadata[i : i + self.PACKET_SIZE])
+
+        server_ips = self.recieve(master_socket)
+
+        master_socket.send(path.encode())
+
+        for server in server_ips:
+            #send chunk to each
+
+
+    def recieve(self, master_socket):
+        data = []
+
+        while True:
+            packet_data = master_socket.recv(self.PACKET_SIZE)
+
+            if packet_data != b"":
+                data.append(packet_data.decode())
+            else:
+                return data
 
 
     def splitFile(self, path, node_count, replication_level=3):
