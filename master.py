@@ -1,3 +1,4 @@
+import network
 import socket
 import threading
 import logging
@@ -16,10 +17,10 @@ class MasterNode:
         self.DB_URI = "file:memdb?mode=memory&cache=shared"
         self.createDB()
 
-        self.TIMEOUT = 0.5
         self.REFRESH = 5
-        self.PORT = 5900
-        self.PACKET_SIZE = 1024
+        self.IP_ADDRESS = ""
+        self.SUBNET = ""
+
         self.kill_threads = False
 
 
@@ -29,10 +30,9 @@ class MasterNode:
         
         self.IP_ADDRESS = temp_sock.getsockname()[0]
         self.SUBNET = (".").join(self.IP_ADDRESS.split(".")[:3]) + "."
+        temp_sock.close()
 
         logging.info("Listening at: {0}".format(self.IP_ADDRESS))
-
-        temp_sock.close()
 
         while True:
             if self.kill_threads:
@@ -40,7 +40,7 @@ class MasterNode:
 
             for x in range(1, 254):
                 ip = self.SUBNET + str(x)
-
+                
                 if ip != self.IP_ADDRESS:
                     threading.Thread(target=self.ping, args=(ip,)).start()
 
@@ -53,8 +53,8 @@ class MasterNode:
 
         try:
             temp_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            temp_sock.settimeout(self.TIMEOUT)
-            temp_sock.connect((server_ip, self.PORT))
+            temp_sock.settimeout(network.TIMEOUT)
+            temp_sock.connect((server_ip, network.PORT))
             temp_sock.send(b"\xa0")
             id = temp_sock.recv(1)
 
@@ -113,68 +113,24 @@ class MasterNode:
                 
                 else:
                     for server in self.serversWithFile(file_path):
-                        threading.Thread(target=self.deleteFile, args=(server, file_path)).start()
+                        threading.Thread(target=self.deleteFileFromServer, args=(server, file_path)).start()
 
             time.sleep(self.REFRESH)
 
 
     def onConnect(self, connection, client):
-        db_conn = sqlite3.connect(self.DB_URI, uri=True)
-        cursor = db_conn.cursor()
-
         control_byte = connection.recv(1)
         logging.info("{0} sent {1}".format(client, control_byte.decode()))
 
         try:
             if control_byte == b"\xb0":    #upload file
-                server_ips = cursor.execute("SELECT ip FROM nodes WHERE online = True").fetchall()
-                server_count = len(server_ips)
-                
-                connection.send(bytes.fromhex(f"{server_count:0{2}x}"))
-
-                chunk_metadata = self.recieveData(connection)
-                chunk_ids = self.parseChunkIDs(chunk_metadata)
-                
-                self.sendData(connection, (",").join(server_ips).encode())
-                
-                file_path = connection.recv(self.PACKET_SIZE).decode()
-                cursor.execute("INSERT INTO files VALUES (?, ?, False)", (file_path, list(dict.fromkeys(chunk_ids))))    #dict thing dedupes
-
-                for (chunk, ip) in list(zip(chunk_ids, server_ips)):
-                    server_id = cursor.execute("SELECT node FROM nodes WHERE ip = ?", (ip,)).fetchone()[0]
-                    cursor.execute("INSERT INTO chunkNodes VALUES (?, ?)", (chunk, server_id))
-
-                    if len(cursor.execute("SELECT file FROM chunks WHERE chunk = ?", (chunk,)).fetchone[0]) == 0:
-                        cursor.execute("INSERT INTO chunks VALUES (?, ?)", (chunk, file_path))
+                self.upload(connection)
 
             elif control_byte == b"\xb1":    #delete file
-                file_path = connection.recv(self.PACKET_SIZE).decode()
-                servers_with_file = self.serversWithFile(file_path)
-
-                logging.info("Deleting file: {0}\nServers storing file: {1}".format(file_path, servers_with_file))
-                cursor.execute("UPDATE files SET deleted = True WHERE file = ?", (file_path,))
-
-                for server in servers_with_file:
-                    threading.Thread(target=self.deleteFileFromServer, args=(server, file_path)).start()
-
-                logging.info("Deleted file: {0}".format(file_path))
+                self.delete(connection)
 
             elif control_byte == b"\xb2":    #download file
-                file_path = connection.recv(self.PACKET_SIZE).decode()
-                logging.info("Retrieving file: {0}".format(file_path))
-
-                chunk_ids = self.parseChunkIDs(cursor.execute("SELECT chunkOrder FROM files WHERE file = ?", (file_path,)).fetchone()[0])
-                server_ips = []
-
-                for chunk in chunk_ids:
-                    server_ip = cursor.execute("SELECT ip FROM nodes WHERE chunkNodes.chunk = ? AND chunkNodes.node = nodes.node AND nodes.online = True").fetchone()[0]
-                    server_ips.append(server_ip)
-
-                    if server_ip == "":
-                        raise Exception("Server not available, cancelling retrieve transaction")    
-                
-                data_for_client = chunk_ids + (",").join(server_ips)
-                self.sendData(connection, data_for_client.encode())
+                self.download(connection)
             
             else:
                 raise Exception("Invalid control byte from connection {0}".format(client))
@@ -184,6 +140,74 @@ class MasterNode:
 
         finally:
             connection.close()
+
+
+    def upload(self, connection):
+        db_conn = sqlite3.connect(self.DB_URI, uri=True)
+        cursor = db_conn.cursor()
+
+        server_ips = cursor.execute("SELECT ip FROM nodes WHERE online = True").fetchall()
+        server_count = len(server_ips)
+        
+        connection.send(bytes.fromhex(f"{server_count:0{2}x}"))
+
+        chunk_metadata = network.recieveData(connection)
+        chunk_ids = self.parseChunkIDs(chunk_metadata)
+        
+        network.sendData(connection, (",").join(server_ips).encode())
+        
+        file_path = connection.recv(network.PACKET_SIZE).decode()
+        cursor.execute("INSERT INTO files VALUES (?, ?, False)", (file_path, list(dict.fromkeys(chunk_ids))))    #dict thing dedupes
+
+        for (chunk, ip) in list(zip(chunk_ids, server_ips)):
+            server_id = cursor.execute("SELECT node FROM nodes WHERE ip = ?", (ip,)).fetchone()[0]
+            cursor.execute("INSERT INTO chunkNodes VALUES (?, ?)", (chunk, server_id))
+
+            if len(cursor.execute("SELECT file FROM chunks WHERE chunk = ?", (chunk,)).fetchone[0]) == 0:
+                cursor.execute("INSERT INTO chunks VALUES (?, ?)", (chunk, file_path))
+
+        db_conn.commit()
+        db_conn.close()
+
+
+    def delete(self, connection):
+        db_conn = sqlite3.connect(self.DB_URI, uri=True)
+        cursor = db_conn.cursor()
+
+        file_path = connection.recv(network.PACKET_SIZE).decode()
+        servers_with_file = self.serversWithFile(file_path)
+
+        logging.info("Deleting file: {0}\nServers storing file: {1}".format(file_path, servers_with_file))
+        cursor.execute("UPDATE files SET deleted = True WHERE file = ?", (file_path,))
+
+        for server in servers_with_file:
+            threading.Thread(target=self.deleteFileFromServer, args=(server, file_path)).start()
+
+        logging.info("Deleted file: {0}".format(file_path))
+
+        db_conn.commit()
+        db_conn.close()
+
+
+    def download(self, connection):
+        db_conn = sqlite3.connect(self.DB_URI, uri=True)
+        cursor = db_conn.cursor()
+
+        file_path = connection.recv(network.PACKET_SIZE).decode()
+        logging.info("Retrieving file: {0}".format(file_path))
+
+        chunk_ids = self.parseChunkIDs(cursor.execute("SELECT chunkOrder FROM files WHERE file = ?", (file_path,)).fetchone()[0])
+        server_ips = []
+
+        for chunk in chunk_ids:
+            server_ip = cursor.execute("SELECT ip FROM nodes WHERE chunkNodes.chunk = ? AND chunkNodes.node = nodes.node AND nodes.online = True").fetchone()[0]
+            server_ips.append(server_ip)
+
+            if server_ip == "":
+                raise Exception("Server not available, cancelling retrieve transaction")    
+        
+        data_for_client = chunk_ids + (",").join(server_ips)
+        network.sendData(connection, data_for_client.encode())
 
         db_conn.commit()
         db_conn.close()
@@ -222,13 +246,13 @@ class MasterNode:
         cursor = db_conn.cursor()
 
         temp_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        temp_sock.settimeout(self.TIMEOUT)
+        temp_sock.settimeout(network.TIMEOUT)
 
         try:
             chunk_id = cursor.execute("""SELECT chunk FROM chunkNodes WHERE chunks.file = ? 
             AND chunks.chunk = chunkNodes.chunk AND chunkNodes.node = ?""", (file_path, server_ip)).fetchone()[0]
 
-            temp_sock.connect((server_ip, self.PORT))
+            temp_sock.connect((server_ip, network.PORT))
             temp_sock.send(b"\xb1")
             temp_sock.send(chunk_id.encode())
 
@@ -242,25 +266,6 @@ class MasterNode:
             temp_sock.close()
 
         db_conn.close()
-
-
-    def sendData(self, connection, data):
-        for i in range(0, len(data), self.PACKET_SIZE):
-            connection.send(data[i : i + self.PACKET_SIZE])
-
-    
-    def recieveData(self, connection):
-        data = []
-
-        while True:
-            packet_data = connection.recv(self.PACKET_SIZE)
-
-            if packet_data != b"":
-                data.append(packet_data)
-            else:
-                break
-
-        return b"".join(data)
 
 
     def createDB(self):
@@ -282,7 +287,7 @@ class MasterNode:
         try:
             server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            server.bind(("0.0.0.0", self.PORT))
+            server.bind(("0.0.0.0", network.PORT))
             server.listen()
 
             threading.Thread(target=self.checkOnlineServers).start()

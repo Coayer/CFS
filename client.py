@@ -1,3 +1,4 @@
+import network
 import socket
 import time
 import threading
@@ -7,12 +8,6 @@ import hashlib
 
 
 class client:
-    def __init__(self):
-        self.TIMEOUT = 0.5
-        self.PORT = 5900
-        self.PACKET_SIZE = 1024
-
-
     def main(self):
         command = sys.argv[0]
         path = sys.argv[1]
@@ -36,6 +31,7 @@ class client:
     def download(self, master_socket, path):
         master_socket.send(b"\xb2")
         master_socket.send(path.encode())
+        #needs work
         
 
     def upload(self, master_socket, path):
@@ -50,28 +46,14 @@ class client:
             chunk_metadata.append(chunk_id)
 
         chunk_metadata = b"".join(chunk_metadata)
+        self.sendData(master_socket, chunk_metadata)
 
-        for i in range(0, len(chunk_metadata), self.PACKET_SIZE):
-            master_socket.send(chunk_metadata[i : i + self.PACKET_SIZE])
-
-        server_ips = self.recieve(master_socket)
+        server_ips = self.recieveData(master_socket)
 
         master_socket.send(path.encode())
 
         for server in server_ips:
             #send chunk to each
-
-
-    def recieve(self, master_socket):
-        data = []
-
-        while True:
-            packet_data = master_socket.recv(self.PACKET_SIZE)
-
-            if packet_data != b"":
-                data.append(packet_data.decode())
-            else:
-                return data
 
 
     def splitFile(self, path, node_count, replication_level=3):
